@@ -1,0 +1,414 @@
+---
+title: "StratifiedWeightedEnsemble"
+output: html_document
+date: "2025-02-27"
+---
+
+```{r}
+library(plyr)
+library(tidyverse)
+library(wrapr)
+library(readxl)
+library(ggplot2)
+library(gridExtra)
+```
+
+```{r}
+# Build demo dataset 
+data <- data.frame(
+  ID = rep(1:3, each = 3),
+  model = rep(c("Adane", "Dolton", "Colin"), times = 3),
+  Pred_conc = c(21.97, 30.58, 19.54, 22.31, 29.88, 18.77, 20.67, 32.01, 17.89),
+  Obs_conc = c(17.31, 17.31, 17.31, 16.12, 16.12, 16.12, 18.22, 18.22, 18.22),
+  pat_height = c(158, 158, 158, 170, 170, 170, 165, 165, 165),
+  pat_weight = c(72, 72, 72, 80, 80, 80, 77, 77, 77),
+  pat_age = c(68, 68, 68, 50, 50, 50, 60, 60, 60),
+  pat_bmi = c(28.84, 28.84, 28.84, 27.68, 27.68, 27.68, 28.25, 28.25, 28.25)
+)
+data
+```
+
+```{r}
+# Define covariates to stratify on
+covariates <- grep("^pat", colnames(data), value = TRUE)
+covariates
+```
+
+
+```{r}
+# set the penalties for both relative bias and RMSE
+rBias_pen = -5
+RMSE_pen  = -5
+```
+
+```{r}
+# In "ModelsImpScores" dataframe we save the importance score for each model in each subgroup
+ModelsImpScores <- data %>% filter(ID==1) %>% select("model")
+ModelsImpScores
+```
+
+
+
+```{r}
+# function to find the quantiles that define the subgroups for each influential covariate
+get_quantile_thresholds <- function(data, covariates, vec_num_quantiles) {
+  
+  # Initialize output list
+  covQuantiles <- list()
+  
+  # Compute quantiles for each covariate
+  for (c in 1:length(covariates)){
+    
+    quantiles <- quantile(data[[covariates[c]]], 
+                      probs = seq(0, 1, length.out = vec_num_quantiles[c] + 1)[-c(1, length(seq(0, 1, length.out = vec_num_quantiles[c] + 1)))], 
+                      na.rm = TRUE)
+
+    covQuantiles[[covariates[c]]] <- quantiles
+    
+  }
+  
+  return(covQuantiles)
+}
+
+```
+
+```{r}
+# define number of quantiles for each covariate
+quantiles <- rep(2, times= length(covariates))
+stratification <- get_quantile_thresholds(data, covariates, quantiles)
+```
+
+```{r}
+stratification
+```
+
+
+
+```{r}
+# Function to compute Importance Scores for each model in each subgroup
+# ----------------------------------------------------------------------------
+# Input:
+#   - data:        A dataset with patient covariates, observations, and model predictions
+#   - covariates:  A character vector specifying influential covariates for stratification
+#   - quantiles:   An integer vector specifying the number of subgroups (quantiles) per covariate (default = 2)
+#
+# Output:
+#   - A named list (`results_list`) where:
+#       - Each element corresponds to a subgroup (e.g., "age_Q1", "renal_function_Q2")
+#       - Contains a numeric vector of model importance scores normalized to sum to 1
+
+
+computeImpScores <- function(data, covariates, quantiles = rep(2, times = length(covariates))) {
+  
+  results_list <- list() # Store results
+  models_list <- list()
+  
+  for (cov in covariates) {
+    
+    # Get the number of quantiles for the current covariate, finding the position in which cov lies in the covariates vector
+    num_quantiles <- quantiles[which(covariates == cov)]  
+    
+    # Compute quantile thresholds and create bins (mutually exclusive)
+    data <- data %>%
+      mutate(!!paste0(cov, "_bin") := cut(.data[[cov]], 
+                                          breaks = quantile(.data[[cov]], probs = seq(0, 1, length.out = num_quantiles + 1), 
+                                                            na.rm = TRUE, include.lowest = TRUE),
+                                          labels = 1:num_quantiles, 
+                                          include.lowest = TRUE))
+    
+    for (q in 1:num_quantiles) {
+      
+      
+      db1 <- data %>%
+        filter(.data[[paste0(cov, "_bin")]] == q) %>%  
+        mutate(
+          PE = (Pred_conc - Obs_conc) / Obs_conc,  # Calculate the metrics
+          MSE = (Pred_conc - Obs_conc)^2 / (Obs_conc^2)
+        ) %>%
+        group_by(model) %>%
+        summarise(
+          rBias = median(PE, na.rm = TRUE),  # Relative Bias
+          RMSE = sqrt(mean(MSE, na.rm = TRUE)),  # RMSE
+          score1 = exp(rBias_pen * abs(rBias)), 
+          score2 = exp(RMSE_pen * RMSE),
+          score = score1 * score2,
+          .groups = "drop"
+        ) %>%
+        mutate(percentage = score / sum(score, na.rm = TRUE))  # Convert scores to percentages
+      
+      # Store results in a list with structured naming
+      results_list[[paste0(cov, "_Q", q)]] <- db1$percentage
+    }
+  }
+  
+  results <- cbind(db1$model, as.data.frame(results_list))
+  
+  return(results)  # Return the results for all quantiles and covariates
+}
+
+```
+
+
+
+
+```{r}
+ModelsImpScores <- computeImpScores(data, covariates)
+ModelsImpScores
+```
+
+
+
+
+```{r}
+# Visualization of important scores, comparing them with RMSE and rBias values
+
+# Plot the relative bias, RMSE and importance scores given by the weighing method 
+
+# need to retrieve data about RMSE, rBias, model for each subgroup of each covariate that are not saved in the function above
+
+# need to really save it just if it useful later
+
+plotImpS <- function(data, cov, quantile){
+  num_quantiles <- quantiles[which(covariates == cov)]
+  
+  data <- data %>%
+      mutate(!!paste0(cov, "_bin") := cut(.data[[cov]], 
+                                          breaks = quantile(.data[[cov]], probs = seq(0, 1, length.out = num_quantiles + 1), 
+                                                            na.rm = TRUE, include.lowest = TRUE),
+                                          labels = 1:num_quantiles, 
+                                          include.lowest = TRUE))
+  
+  db1 <- data %>%
+        filter(.data[[paste0(cov, "_bin")]] == quantile) %>%  
+        mutate(
+          PE = (Pred_conc - Obs_conc) / Obs_conc,  # Calculate the metrics
+          MSE = (Pred_conc - Obs_conc)^2 / (Obs_conc^2)
+        ) %>%
+        group_by(model) %>%
+        summarise(
+          rBias = median(PE, na.rm = TRUE),  # Relative Bias
+          RMSE = sqrt(mean(MSE, na.rm = TRUE)),  # RMSE
+          score1 = exp(rBias_pen * abs(rBias)), 
+          score2 = exp(RMSE_pen * RMSE),
+          score = score1 * score2,
+          .groups = "drop"
+        ) %>%
+        mutate(percentage = score / sum(score, na.rm = TRUE))
+  
+    plot1 <- ggplot(db1, aes(model, rBias)) + geom_col(aes(reorder(model,percentage),rBias)) + theme_bw() + ylim(-0.6,0.9)
+    
+  plot2 <- ggplot(db1, aes(model, RMSE)) + geom_col(aes(reorder(model,percentage),RMSE)) + theme_bw() + ylim(0,0.8)
+  
+  plot3 <- ggplot(db1, aes(model, percentage)) + geom_col(aes(reorder(model,percentage),percentage)) + theme_bw() + ylim(-0,1)
+  
+  grid.arrange(plot1,plot2,plot3,nrow=3, top=paste(cov, "subgroup", quantile, sep = " "))
+    
+}
+```
+
+```{r}
+cov <- covariates[1]
+quantile <- 1
+plotImpS(data, cov, quantile)
+```
+
+```{r}
+# Add prediction/observation percentage column, since it will be useful to compute subgroup-specific score
+data <- data %>%
+  mutate(pred_obs_percent = (Pred_conc / Obs_conc) * 100)
+data
+```
+
+
+```{r}
+# compute subgroup-specific scores, computed as the percentage of prediction/observation ratios that are outside the 80-120% interval
+
+computeMisclassificationRates <- function(data, covariates, quantiles) {
+  results_list <- list()  # Initialize an empty list to store results
+  
+  # Loop through each covariate
+  for (i in seq_along(covariates)) {
+    cov <- covariates[i]  # Extract covariate name
+    num_quantiles <- quantiles[i]  # Get the number of quantiles for this covariate
+    
+    # Compute quantile thresholds dynamically
+    quantile_vals <- quantile(data[[cov]], probs = seq(0, 1, length.out = num_quantiles + 1), na.rm = TRUE)
+    
+    # Loop through each quantile range
+    for (q in 1:num_quantiles) {
+      
+      # Define filtering conditions for each subgroup
+      if (q == 1) {
+        subgroup_data <- data %>% filter(.data[[cov]] < quantile_vals[q + 1])  # First quantile
+      } else if (q == num_quantiles) {
+        subgroup_data <- data %>% filter(.data[[cov]] >= quantile_vals[q])  # Last quantile
+      } else {
+        subgroup_data <- data %>% filter(.data[[cov]] >= quantile_vals[q] & .data[[cov]] < quantile_vals[q + 1])
+      }
+      
+      # Compute percentage of predictions outside the 80-125% range
+      misclass_df <- subgroup_data %>%
+        count(pred_obs_percent < 80 | pred_obs_percent > 125) %>%
+        mutate(percentage = n / sum(n)) %>%
+        filter(`pred_obs_percent < 80 | pred_obs_percent > 125` == TRUE) %>%  # Retain only percentage of TRUE
+        select(percentage)  # Keep only the percentage column
+      
+      # Add subgroup column for identification
+      misclass_df <- misclass_df %>%
+        mutate(subgroup = paste0(cov, "_Q", q))
+      
+      # Store results in the list
+      results_list[[paste0(cov, "_Q", q)]] <- misclass_df
+    }
+  }
+  
+  # Convert list to a single combined data frame
+  results_df <- bind_rows(results_list, .id = "subgroup")  # Combine all results
+  
+  return(results_df)  # Return final data frame
+}
+
+
+```
+
+```{r}
+misClassified <- computeMisclassificationRates(data, covariates, quantiles)
+misClassified
+```
+
+
+
+```{r}
+# function that finds to which subgroups the given patient belong for each present covariate
+findPatientSubgroups <- function(new_patient, covariates, stratification){
+  
+  subgroups <- list()
+  for (i in seq_along(covariates)) {
+    
+    # check if that covariate is available for the given patient
+    if (new_patient[i]<999){
+    
+    num_quantiles <- quantiles[i]  # Get the number of quantiles for this covariate
+    quantiles <- stratification[[i]] # Get quantiles of this covariate
+    
+    subgroup <- sum(new_patient[i] >= quantiles) + 1
+    subgroups[i] <- subgroup
+    }else{
+      # set missing covariate as subgroup 0
+      subgroups[i] <- 0
+    }
+  }
+  return(subgroups)
+}
+```
+
+
+
+
+```{r}
+computeNewPatientScore <- function(subgroupsList, covariates, ModelsImpScores, misClassified){
+  
+  totSubScore <- 0
+  model_vector <- ModelsImpScores[1][[1]]
+  modelsWeights <- data.frame(
+          ModelName = model_vector,
+          Scores = rep(0, length(model_vector))) # Column filled with zeros
+
+  
+  for (c in 1:length(covariates)){
+    
+    # Retrieve the subgroup-specific score
+    subScore <- misClassified %>%
+  filter(grepl(covariates[c], subgroup) & grepl(subgroupsList[[c]], subgroup)) %>%
+  select(percentage)
+    
+    
+    
+    # Update total subgroup-specific score related to patient
+    totSubScore <- totSubScore + subScore[[1]]
+    
+    # Retrieve the models score related to current covariate
+    column <- which(grepl(covariates[c], colnames(ModelsImpScores)) & grepl(subgroupsList[[c]], colnames(ModelsImpScores)))
+    modelsScores <- ModelsImpScores[column]
+    
+    modelsWeights["Scores"] <- modelsWeights["Scores"] + modelsScores[[1]]*rep(subScore[[1]], times=length(model_vector))
+    
+    
+    
+  }
+  
+  modelsWeights["Scores"] <- modelsWeights["Scores"]/rep(totSubScore, times=3)
+  
+  return(modelsWeights)
+}
+```
+
+
+
+```{r}
+# enter influential covariates values for the new patient, following the order of covariates present in variable 'covariates'
+# if a covariate is missing, it is indicated as '999'
+new_patient <- c(155, 76, 61, 27)
+
+# Find the subgroups to which the patient belongs
+subgroupsList <- findPatientSubgroups(new_patient, covariates, stratification)
+
+# Compute models scores for the patient
+patientModelScores <- computeNewPatientScore(subgroupsList, covariates, ModelsImpScores, misClassified)
+patientModelScores
+
+# Compute prediction
+```
+
+```{r}
+# enter influential covariates values for the new patient, following the order of covariates present in variable 'covariates'
+# if a covariate is missing, it is indicated as '999'
+new_patient2 <- c(170, 82, 40, 23)
+
+# Find the subgroups to which the patient belongs
+subgroupsList <- findPatientSubgroups(new_patient2, covariates, stratification)
+
+# Compute models scores for the patient
+patientModelScores2 <- computeNewPatientScore(subgroupsList, covariates, ModelsImpScores, misClassified)
+patientModelScores2
+
+# Compute prediction
+```
+
+```{r}
+# Plot the Models scores for different patients
+plot1 <- ggplot(patientModelScores, aes(ModelName, Scores)) + geom_col(aes(ModelName, Scores)) + theme_bw() + ylim(0,1)
+    
+plot2 <- ggplot(patientModelScores2, aes(ModelName, Scores)) + geom_col(aes(ModelName, Scores)) + theme_bw() + ylim(0,1)
+  
+grid.arrange(plot1,plot2,nrow=2, top="New patients models weights")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
